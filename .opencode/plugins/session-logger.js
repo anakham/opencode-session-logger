@@ -1,9 +1,49 @@
+
+let SESSION_DIR = process.env.OPENCODE_SESSION_DIR || "";
+let DEBUG = process.env.OPENCODE_LOGGER_DEBUG === "1" || null;
+
 const fs = require("fs");
 const path = require("path");
 
-const SESSION_DIR = "sessions";
-const DEBUG_LOG = path.join(SESSION_DIR, "debug.log");
-const DEBUG = process.env.OPENCODE_LOGGER_DEBUG === "1";
+let DEBUG_LOG = path.join(SESSION_DIR, "debug.log");
+
+function loadPluginConfig() {
+  const pluginPath = __filename;
+  const pluginDir = path.dirname(pluginPath);
+  const parentDir = path.dirname(pluginDir);
+  
+  const configFiles = [
+    path.join(pluginDir, "session-logger.json"),
+    path.join(parentDir, "session-logger.json"),
+  ];
+  
+  let loadedConfig = {};
+  
+  for (const configFile of configFiles) {
+    try {
+      if (fs.existsSync(configFile)) {
+        const content = fs.readFileSync(configFile, "utf8");
+        loadedConfig = JSON.parse(content);
+        debugLog('Loaded plugin config: ' + JSON.stringify(loadedConfig));
+        if (SESSION_DIR === "") {
+          SESSION_DIR = loadedConfig.sessionsDir || SESSION_DIR;
+          if (SESSION_DIR === "")
+            DEBUG = false;
+        }
+        if (SESSION_DIR != "")
+          DEBUG_LOG = path.join(SESSION_DIR, "debug.log");
+        if (DEBUG === null)
+          DEBUG = loadedConfig.debug === true;
+        debugLog(`Plugin config loaded from: ${configFile}`);
+        return loadedConfig;
+      }
+    } catch (e) {}
+  }
+  return {};
+}
+
+const pluginConfig = loadPluginConfig();
+
 
 function debugLog(msg) {
   if (!DEBUG) return;
@@ -12,10 +52,12 @@ function debugLog(msg) {
   } catch (e) {}
 }
 
+debugLog(`Plugin initialized: sessionsDir=${SESSION_DIR}, debug=${DEBUG}`);
+
 function ensureSessionDir() {
-  try {
-    fs.mkdirSync(SESSION_DIR, { recursive: true });
-  } catch (e) {}
+  if (SESSION_DIR === "")
+    return false;
+  return fs.existsSync(SESSION_DIR);
 }
 
 function sanitizeFilename(str) {
@@ -83,7 +125,19 @@ function createSessionState(sessionID, logFile, title, startTime, isNew) {
 }
 
 module.exports = async function (ctx) {
-  ensureSessionDir();
+  if (!ensureSessionDir()) {
+    if (SESSION_DIR === "") {
+      debugLog("No session directory configured. Set OPENCODE_SESSION_DIR env variable or provide session-logger.json config.");
+    } else {
+      debugLog(`Session directory ${SESSION_DIR} not exists`);
+    }
+ 
+    return {
+      event: async function () {
+        // No-op if session directory is not available
+      },
+    };
+  }
 
   return {
     event: async function (input) {
