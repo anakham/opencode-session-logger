@@ -1,9 +1,13 @@
 
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 let SESSION_DIR = process.env.OPENCODE_SESSION_DIR || "";
 let DEBUG = process.env.OPENCODE_LOGGER_DEBUG === "1" || null;
-
-const fs = require("fs");
-const path = require("path");
 
 let DEBUG_LOG = path.join(SESSION_DIR, "debug.log");
 
@@ -46,6 +50,7 @@ const pluginConfig = loadPluginConfig();
 
 
 function debugLog(msg) {
+  // NOTE: SESSION_DIR must exist and DEBUG must be true for logs to write
   if (!DEBUG) return;
   try {
     fs.appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
@@ -89,11 +94,19 @@ function getLogFile(sessionId, title, timestamp) {
 
 function log(content, filePath, tag) {
   try {
+    let lineNum = '';
+    if (DEBUG) {
+      try { throw new Error(); } catch (e) {
+        const stack = e.stack.split('\n')[2];
+        const match = stack.match(/:(\d+):/);
+        lineNum = match ? ` (line ${match[1]})` : '';
+      }
+    }
     if (typeof content === "string") {
       content = content.replace(/\\n/g, "\n");
     }
-    if (tag && DEBUG) {
-      content = `[${tag}] ${content}`;
+    if (tag || DEBUG) {
+      content = `\n[${tag || ''}${lineNum}]\n${content}`;
     }
     fs.appendFileSync(filePath || getLogFile(), content);
   } catch (e) {}
@@ -105,6 +118,7 @@ function flushLog(filePath) {
   } catch {}
 }
 
+// Track active sessions by ID
 const activeSessions = new Map();
 
 function createSessionState(sessionID, logFile, title, startTime, isNew) {
@@ -119,12 +133,15 @@ function createSessionState(sessionID, logFile, title, startTime, isNew) {
     processedTools: new Set(),
     processedPermissions: new Set(),
     isReasoning: false,
+    reasoningPartIDs: new Set(),
     lastDiff: [],
     lastPermission: null,
   };
 }
 
-module.exports = async function (ctx) {
+export const server = async function (ctx) {
+  console.error("PLUGIN: server function called! ctx=", ctx);
+  debugLog(`=== Plugin called (ensureSessionDir=${ensureSessionDir()}) ===`);
   if (!ensureSessionDir()) {
     if (SESSION_DIR === "") {
       debugLog("No session directory configured. Set OPENCODE_SESSION_DIR env variable or provide session-logger.json config.");
@@ -143,7 +160,7 @@ module.exports = async function (ctx) {
     event: async function (input) {
       const event = input.event;
       const props = event.properties || {};
-      debugLog(`  [very verbose] Event: ${JSON.stringify(event)}`);
+      debugLog(`[verbose] Event: ${JSON.stringify(event)}`);
       if (event.type === "server.instance.disposed") {
         debugLog("server.instance.disposed fired");
         
@@ -228,7 +245,7 @@ module.exports = async function (ctx) {
               "",
             ].filter((line) => line !== "").join("\n");
 
-            log(header, logFile);
+            log(header, logFile, `[header]`);
             flushLog(logFile);
           }
         }
@@ -289,19 +306,34 @@ module.exports = async function (ctx) {
       }
 
       if (event.type === "message.part.delta") {
-        const { messageID, field, delta } = props;
-        debugLog(`delta: msgID=${messageID}, field=${field}, deltaLen=${delta?.length}, trimmed=${delta?.trim()?.length}`);
+        const { messageID, field, delta, partID } = props;
+        debugLog(`delta: msgID=${messageID}, field=${field}, deltaLen=${delta?.length}, partID=${partID}`);
         if (field !== "text" || !delta) return;
 
         const state = activeSessions.get(sessionID);
         if (!state) return;
 
-        if (delta.trim() && state.loggedDeltas.has(messageID)) {
+        if (partID && state.reasoningPartIDs.has(partID)) {
+          if (!state.isReasoning) {
+            state.isReasoning = true;
+            log(`\n> *Thinking...* `, state.logFile);
+          }
+          log(delta, state.logFile, `[reasoning.delta]`);
           return;
         }
-        if (delta.trim()) {
-          state.loggedDeltas.add(messageID);
+
+        if (state.isReasoning) {
+          state.isReasoning = false;
+          log(`\n`, state.logFile, `[isResoning:true->false]`);
         }
+
+        if (delta.length === 0) {
+          return;
+        }
+        if (state.loggedDeltas.has(messageID)) {
+          return;
+        }
+        state.loggedDeltas.add(messageID);
         log(delta, state.logFile, `delta:${messageID}`);
         return;
       }
@@ -312,6 +344,18 @@ module.exports = async function (ctx) {
 
         const state = activeSessions.get(sessionID);
         if (!state) return;
+
+        if (part.type === "reasoning") {
+          if (part.id) {
+            state.reasoningPartIDs.add(part.id);
+            debugLog(`Registered reasoning part: ${part.id}`);
+          }
+          return;
+        }
+
+        if (state.isReasoning && part.type !== "reasoning") {
+          state.isReasoning = false;
+        }
 
         if (part.type === "text") {
           if (part.text) {
@@ -330,9 +374,12 @@ module.exports = async function (ctx) {
         } else if (part.type === "tool") {
           const toolName = part.tool || "unknown";
           const status = part.state?.status || "";
-          const toolKey = part.id ? `${part.id}-${status}` : `${sessionID}-${toolName}-${status}`;
+          const toolKey = part.id || `${sessionID}-${toolName}`;
 
           if (status === "completed" || status === "error") {
+            if (!state.processedTools.has(toolKey)) {
+              state.processedTools.add(toolKey);
+            }
             let targetInfo = "";
             const input = part.state?.input;
             if (typeof input === "object") {
@@ -342,17 +389,17 @@ module.exports = async function (ctx) {
             log(`\n#### ${toolName}${targetInfo} [${status}]\n`, state.logFile, `tool:${status}:${toolName}`);
             const meta = part.state?.metadata;
             if (meta?.diff) {
-              log(`\`\`\`diff\n${meta.diff}\n\`\`\`\n`, state.logFile, `tool:diff:${toolName}`);
+              log(`\n\`\`\`diff\n${meta.diff}\n\`\`\`\n`, state.logFile, `tool:diff:${toolName}`);
             }
             if (meta?.output || meta?.result || meta?.preview) {
               const content = meta.output || meta.result || meta.preview || "";
               if (typeof content === "string" && content.trim()) {
-                log(`\`\`\`\n${content}\n\`\`\`\n`, state.logFile);
+                log(`\n\`\`\`\n${content}\n\`\`\`\n`, state.logFile);
               }
             }
+          } else if (status === "rejected") {
             if (state.processedTools.has(toolKey)) return;
             state.processedTools.add(toolKey);
-          } else if (status === "rejected") {
             let targetInfo = "";
             const input = part.state?.input;
             if (typeof input === "object") {
@@ -360,34 +407,36 @@ module.exports = async function (ctx) {
               else if (input.command) targetInfo = ` \`${input.command}\``;
             }
             log(`\n#### ${toolName}${targetInfo} [rejected]\n`, state.logFile);
-            if (state.processedTools.has(toolKey)) return;
-            state.processedTools.add(toolKey);
-          } else if (status === "pending" && part.state?.input && !state.processedTools.has(toolKey)) {
-            state.processedTools.add(toolKey);
-            let targetInfo = "";
-            const input = part.state.input;
-            if (typeof input === "object") {
-              if (input.filePath) targetInfo = ` ${input.filePath}`;
-              else if (input.command) targetInfo = ` \`${input.command}\``;
-            }
-            log(`\n#### ${toolName}${targetInfo} [pending]\n`, state.logFile);
-            let inputStr = "";
-            if (typeof part.state.input === "object") {
-              if (part.state.input.command) {
-                inputStr = part.state.input.command;
-              } else if (part.state.input.filePath) {
-                inputStr = part.state.input.filePath;
-              } else {
-                const keys = Object.keys(part.state.input);
-                if (keys.length > 0) {
-                  inputStr = JSON.stringify(part.state.input, null, 2).slice(0, 2000);
-                }
+          } else if (status === "pending" && part.state?.input) {
+            if (state.processedTools.has(toolKey)) {
+              debugLog(`tool ${toolKey} pending but already processed, skipping`);
+            } else {
+              state.processedTools.add(toolKey);
+              let targetInfo = "";
+              const input = part.state.input;
+              if (typeof input === "object") {
+                if (input.filePath) targetInfo = ` ${input.filePath}`;
+                else if (input.command) targetInfo = ` \`${input.command}\``;
               }
-            } else if (part.state.input) {
-              inputStr = String(part.state.input);
-            }
-            if (inputStr) {
-              log(`\`\`\`\n${inputStr}\n\`\`\`\n`, state.logFile);
+              log(`\n#### ${toolName}${targetInfo} [pending]\n`, state.logFile);
+              let inputStr = "";
+              if (typeof part.state.input === "object") {
+                if (part.state.input.command) {
+                  inputStr = part.state.input.command;
+                } else if (part.state.input.filePath) {
+                  inputStr = part.state.input.filePath;
+                } else {
+                  const keys = Object.keys(part.state.input);
+                  if (keys.length > 0) {
+                    inputStr = JSON.stringify(part.state.input, null, 2).slice(0, 2000);
+                  }
+                }
+              } else if (part.state.input) {
+                inputStr = String(part.state.input);
+              }
+              if (inputStr) {
+                log(`\n\`\`\`\n${inputStr}\n\`\`\`\n`, state.logFile);
+              }
             }
           }
         }
@@ -405,7 +454,7 @@ module.exports = async function (ctx) {
         if (state.processedTools.has(toolKey)) return;
         state.processedTools.add(toolKey);
 
-        log(`\`\`\`\n${result}\n\`\`\`\n`, state.logFile);
+        log(`\n\`\`\`\n${result}\n\`\`\`\n`, state.logFile);
         flushLog(state.logFile);
         return;
       }
@@ -433,7 +482,7 @@ module.exports = async function (ctx) {
         if (!state) return;
 
         state.isReasoning = true;
-        log(`\n> *Thinking...*\n`, state.logFile);
+        log(`\n> *Thinking... `, state.logFile);
         return;
       }
 
@@ -447,7 +496,7 @@ module.exports = async function (ctx) {
       if (event.type === "session.next.reasoning.ended") {
         const state = activeSessions.get(sessionID);
         if (!state || !state.isReasoning) return;
-        log(`\n`, state.logFile);
+        log(`\n`, state.logFile, `[reasoning.ended]`);
         state.isReasoning = false;
         return;
       }
@@ -500,7 +549,7 @@ module.exports = async function (ctx) {
         } else {
           msg += "\n";
         }
-        log(msg, state.logFile);
+        log(msg, state.logFile, `[permission.asked.msg]`);
         return;
       }
 
@@ -529,4 +578,4 @@ module.exports = async function (ctx) {
       }
     },
   };
-};
+}
