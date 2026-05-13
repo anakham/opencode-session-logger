@@ -99,13 +99,13 @@ function log(content, filePath, tag) {
       try { throw new Error(); } catch (e) {
         const stack = e.stack.split('\n')[2];
         const match = stack.match(/:(\d+):/);
-        lineNum = match ? ` (line ${match[1]})` : '';
+        lineNum = match ? ` (line${match[1]})` : '';
       }
     }
     if (typeof content === "string") {
       content = content.replace(/\\n/g, "\n");
     }
-    if (tag || DEBUG) {
+    if (DEBUG) {
       content = `\n[${tag || ''}${lineNum}]\n${content}`;
     }
     fs.appendFileSync(filePath || getLogFile(), content);
