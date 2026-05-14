@@ -83,15 +83,6 @@ function findExistingSessionFile(sessionId) {
   }
 }
 
-function getLogFile(sessionId, title, timestamp) {
-  const ts = timestamp || formatTimestamp(new Date());
-  if (sessionId) {
-    const name = title ? `${sessionId}-${sanitizeFilename(title)}` : sessionId;
-    return path.join(SESSION_DIR, `${ts}-${name}.md`);
-  }
-  return path.join(SESSION_DIR, `${ts}.md`);
-}
-
 function log(content, filePath, tag) {
   try {
     let lineNum = '';
@@ -99,7 +90,7 @@ function log(content, filePath, tag) {
       try { throw new Error(); } catch (e) {
         const stack = e.stack.split('\n')[2];
         const match = stack.match(/:(\d+):/);
-        lineNum = match ? ` (line${match[1]})` : '';
+        lineNum = match ? `(line${match[1]})` : '';
       }
     }
     if (typeof content === "string") {
@@ -108,7 +99,7 @@ function log(content, filePath, tag) {
     if (DEBUG) {
       content = `\n[${tag || ''}${lineNum}]\n${content}`;
     }
-    fs.appendFileSync(filePath || getLogFile(), content);
+    fs.appendFileSync(filePath, content);
   } catch (e) {}
 }
 
@@ -118,25 +109,160 @@ function flushLog(filePath) {
   } catch {}
 }
 
-// Track active sessions by ID
 const activeSessions = new Map();
 
-function createSessionState(sessionID, logFile, title, startTime, isNew) {
-  return {
-    sessionID,
-    logFile,
-    startTime,
-    title,
-    isNew,
-    processedMessages: new Set(),
-    loggedDeltas: new Set(),
-    processedTools: new Set(),
-    processedPermissions: new Set(),
-    isReasoning: false,
-    reasoningPartIDs: new Set(),
-    lastDiff: [],
-    lastPermission: null,
-  };
+class SessionState {
+  constructor(sessionID, logFile, title, timestamp) {
+    this.sessionID = sessionID;
+    this._logFile = logFile;
+    this.title = title;
+    this.logFile = logFile;
+    this.processedMessages = new Set();
+    this.loggedDeltas = new Set();
+    this.processedTools = new Set();
+    this.processedPermissions = new Set();
+    this.isReasoning = false;
+    this.reasoningPartIDs = new Set();
+    this.lastDiff = [];
+    this.lastPermission = null;
+    this.symlinkPath = path.join(SESSION_DIR, "current_session.md");
+    this._timestamp = timestamp;
+    this._updateSymlink();
+  }
+
+  set logFile(value) {
+    this._logFile = value;
+    this._updateSymlink();
+  }
+
+  get logFile() {
+    return this._logFile;
+  }
+
+  set title(value) {
+    const oldLogFile = this._logFile;
+    this._title = value;
+    if (value && value !== this.startTitle) {
+      const newLogFile = SessionState.getLogFile(this.sessionID, value, this._timestamp);
+      if (newLogFile !== oldLogFile) {
+        try {
+          fs.renameSync(oldLogFile, newLogFile);
+          this._logFile = newLogFile;
+          this._updateSymlink();
+        } catch (e) {}
+      }
+      log(`\n> **[Title Updated]** ${new Date().toISOString()}: ${value}\n`, this._logFile);
+    }
+  }
+
+  get title() {
+    return this._title;
+  }
+
+  _updateSymlink() {
+
+    if (!this.logFile || !this.symlinkPath) return;
+    try {
+      if (fs.existsSync(this.symlinkPath)) {
+        fs.unlinkSync(this.symlinkPath);
+      }
+      const relativeTarget = path.basename(this.logFile);
+      fs.symlinkSync(relativeTarget, this.symlinkPath);
+
+    } catch (e) {
+      debugLog(`    Symlink error: ${e.message}`);
+    }
+  }
+
+  _removeSymlink() {
+    if (!this.symlinkPath) return;
+    try {
+      if (fs.existsSync(this.symlinkPath)) {
+        fs.unlinkSync(this.symlinkPath);
+      }
+    } catch (e) {
+      debugLog(`Symlink remove error: ${e.message}`);
+    }
+  }
+
+  finalizeSession() {
+    debugLog(`  session ${this.sessionID}: logFile=${this.logFile}, lastDiff=${JSON.stringify(this.lastDiff)}`);
+    if (!this.logFile || !fs.existsSync(this.logFile)) return;
+    const timestamp = new Date().toISOString();
+    log(`\n> --- Session ended ${timestamp} ---\n`, this.logFile);
+    if (this.lastDiff && this.lastDiff.length > 0) {
+      log(`\n> Changed files:\n`, this.logFile);
+      for (const d of this.lastDiff) {
+        const sign = d.status === "added" ? "A" : d.status === "deleted" ? "D" : "M";
+        const stat = d.additions || d.deletions ? ` (+${d.additions || 0}/-${d.deletions || 0})` : "";
+        log(`>   ${sign} ${d.file}${stat}\n`, this.logFile);
+      }
+    }
+    this._removeSymlink();
+  }
+
+  static getLogFile(sessionId, title, timestamp) {
+    const ts = timestamp || formatTimestamp(new Date());
+    if (sessionId) {
+      const name = title ? `${sessionId}-${sanitizeFilename(title)}` : sessionId;
+      return path.join(SESSION_DIR, `${ts}-${name}.md`);
+    }
+    return path.join(SESSION_DIR, `${ts}.md`);
+  }
+
+  static createOrRestore(sessionID, info, ctx) {
+    const existing = activeSessions.get(sessionID);
+    if (existing) {
+      debugLog(`SessionState.createOrRestore: found existing state for ${sessionID}`);
+      return existing;
+    }
+
+    const title = info?.title || info?.slug || "";
+    const startTime = info?.time?.created ? new Date(info.time.created) : new Date();
+    const timestamp = formatTimestamp(startTime);
+
+    const existingFile = findExistingSessionFile(sessionID);
+    let logFile;
+    let isNew = false;
+
+    if (existingFile) {
+      logFile = path.join(SESSION_DIR, existingFile);
+    } else {
+      logFile = SessionState.getLogFile(sessionID, title, timestamp);
+      isNew = true;
+    }
+
+    const state = new SessionState(sessionID, logFile, title, timestamp);
+    activeSessions.set(sessionID, state);
+
+    if (isNew) {
+      const header = [
+        "---",
+        `## Session: ${sessionID}`,
+        title ? `### Title: ${title}` : "",
+        `Started: ${startTime}`,
+        `Directory: ${ctx.directory}`,
+        info.summary ? `### Summary: +${info.summary.additions}/-${info.summary.deletions} in ${info.summary.files} files` : "",
+        "---",
+        "",
+        "## Chat History",
+        "",
+      ].filter((line) => line !== "").join("\n");
+
+      log(header, state.logFile);
+      flushLog(state.logFile);
+    }
+
+    return state;
+  }
+}
+
+function getSession(sessionID) {
+  const state = activeSessions.get(sessionID);
+  if (state) {
+    state._updateSymlink();
+  }
+  return state;
 }
 
 export const server = async function (ctx) {
@@ -158,28 +284,24 @@ export const server = async function (ctx) {
 
   return {
     event: async function (input) {
+      try {
+        eventHandler(input);
+      } catch (e) {
+        debugLog(`event ERROR: ${e.message}`);
+      }
+    }
+  };
+}
+
+async function eventHandler (input) {
       const event = input.event;
       const props = event.properties || {};
-      debugLog(`[verbose] Event: ${JSON.stringify(event)}`);
+      //debugLog(`[verbose] Event: ${JSON.stringify(event)}`);
       if (event.type === "server.instance.disposed") {
         debugLog("server.instance.disposed fired");
         
-        const timestamp = new Date().toISOString();
-        
         for (const state of activeSessions.values()) {
-          debugLog(`  session ${state.sessionID}: logFile=${state.logFile}, lastDiff=${JSON.stringify(state.lastDiff)}`);
-          if (state.logFile && fs.existsSync(state.logFile)) {
-            log(`\n> --- Session ended ${timestamp} ---\n`, state.logFile);
-            
-            if (state.lastDiff && state.lastDiff.length > 0) {
-              log(`\n> Changed files:\n`, state.logFile);
-              for (const d of state.lastDiff) {
-                const sign = d.status === "added" ? "A" : d.status === "deleted" ? "D" : "M";
-                const stat = d.additions || d.deletions ? ` (+${d.additions || 0}/-${d.deletions || 0})` : "";
-                log(`>   ${sign} ${d.file}${stat}\n`, state.logFile);
-              }
-            }
-          }
+          state.finalizeSession();
         }
         
         activeSessions.clear();
@@ -210,58 +332,10 @@ export const server = async function (ctx) {
         debugLog(`session.created/updated: id=${info?.id}, title=${info?.title}, time=${info?.time?.created}`);
         if (!info || !info.id) return;
 
-        const title = info.title || info.slug || "";
-        const timestamp = info.time?.created ? formatTimestamp(new Date(info.time.created)) : formatTimestamp(new Date());
-        let state = activeSessions.get(sessionID);
+        const state = SessionState.createOrRestore(sessionID, info, ctx);
 
-        if (!state) {
-          const existingFile = findExistingSessionFile(sessionID);
-          let logFile;
-          let isNew = false;
-
-          if (existingFile) {
-            logFile = path.join(SESSION_DIR, existingFile);
-          } else {
-            logFile = getLogFile(sessionID, title, timestamp);
-            isNew = true;
-          }
-
-          const startTime = info.time?.created ? new Date(info.time.created).toISOString() : new Date().toISOString();
-
-          state = createSessionState(sessionID, logFile, title, startTime, isNew);
-          activeSessions.set(sessionID, state);
-
-          if (isNew) {
-            const header = [
-              "---",
-              `## Session: ${sessionID}`,
-              title ? `### Title: ${title}` : "",
-              `Started: ${startTime}`,
-              `Directory: ${ctx.directory}`,
-              info.summary ? `### Summary: +${info.summary.additions}/-${info.summary.deletions} in ${info.summary.files} files` : "",
-              "---",
-              "",
-              "## Chat History",
-              "",
-            ].filter((line) => line !== "").join("\n");
-
-            log(header, logFile, `[header]`);
-            flushLog(logFile);
-          }
-        }
-
-        if (title && title !== state.title) {
-          const oldLogFile = state.logFile;
-          state.title = title;
-          log(`\n> **[Title Updated]** ${new Date().toISOString()}: ${title}\n`, state.logFile);
-
-          const newLogFile = getLogFile(sessionID, title, timestamp);
-          if (newLogFile !== oldLogFile) {
-            try {
-              fs.renameSync(oldLogFile, newLogFile);
-              state.logFile = newLogFile;
-            } catch (e) {}
-          }
+        if (state.title && state.title !== info.title) {
+          state.title = info.title;
         }
         return;
       }
@@ -271,23 +345,10 @@ export const server = async function (ctx) {
         debugLog(`message.updated: id=${info?.id}, role=${info?.role}, title=${info?.title}`);
         if (!info || info.role === "system") return;
 
-        let state = activeSessions.get(sessionID);
+        let state = getSession(sessionID);
         if (!state) {
-          debugLog(`message.updated: creating state for ${sessionID}`);
-          const existingFile = findExistingSessionFile(sessionID);
-          let logFile, startTime;
-          if (existingFile) {
-            logFile = path.join(SESSION_DIR, existingFile);
-            const match = existingFile.match(/^(\d{8}-\d{4})-/);
-            if (match) {
-              const y = match[1].slice(0, 4), m = match[1].slice(4, 6), d = match[1].slice(6, 8), h = match[1].slice(9, 11), min = match[1].slice(11, 13);
-              startTime = `${y}-${m}-${d}T${h}:${min}:00.000Z`;
-            }
-          }
-          if (!startTime) startTime = new Date().toISOString();
-          logFile = logFile || getLogFile(sessionID, "", formatTimestamp(new Date()));
-          state = createSessionState(sessionID, logFile, "", startTime, false);
-          activeSessions.set(sessionID, state);
+          debugLog(`message.updated: no state found, calling createOrRestore for ${sessionID}`);
+          state = SessionState.createOrRestore(sessionID, info);
         }
 
         if (state.processedMessages.has(info.id)) {
@@ -310,7 +371,7 @@ export const server = async function (ctx) {
         debugLog(`delta: msgID=${messageID}, field=${field}, deltaLen=${delta?.length}, partID=${partID}`);
         if (field !== "text" || !delta) return;
 
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         if (partID && state.reasoningPartIDs.has(partID)) {
@@ -342,7 +403,7 @@ export const server = async function (ctx) {
         const part = props.part;
         if (!part) return;
 
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         if (part.type === "reasoning") {
@@ -444,7 +505,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "tool.execute.after") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         const result = (props.result || "").trim();
@@ -460,7 +521,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "session.diff") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (state) {
           state.lastDiff = props.diff || [];
         }
@@ -468,7 +529,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "file.edited") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         debugLog(`file.edited: ${JSON.stringify(props)}`);
@@ -478,7 +539,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "session.next.reasoning.started") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         state.isReasoning = true;
@@ -487,14 +548,14 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "session.next.reasoning.delta") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state || !state.isReasoning) return;
         log(props.delta, state.logFile);
         return;
       }
 
       if (event.type === "session.next.reasoning.ended") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state || !state.isReasoning) return;
         log(`\n`, state.logFile, `[reasoning.ended]`);
         state.isReasoning = false;
@@ -502,7 +563,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "command.executed") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         const { name, arguments: args } = props;
@@ -512,7 +573,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "session.next.prompted") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         const { prompt } = props;
@@ -525,7 +586,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "permission.asked") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         debugLog(`permission.asked: ${JSON.stringify(props)}`);
@@ -554,7 +615,7 @@ export const server = async function (ctx) {
       }
 
       if (event.type === "permission.replied") {
-        const state = activeSessions.get(sessionID);
+        const state = getSession(sessionID);
         if (!state) return;
 
         const { reply } = props;
@@ -576,6 +637,4 @@ export const server = async function (ctx) {
         log(msg, state.logFile);
         return;
       }
-    },
-  };
 }

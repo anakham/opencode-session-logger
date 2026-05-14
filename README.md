@@ -250,8 +250,18 @@ project/
 │       └── session-logger.js   # The plugin
 ├── sessions/                    # Session logs directory
 │   ├── debug.log               # Debug output (when enabled)
+│   ├── current_session.md      # Symlink to active session file
 │   └── YYYYMMDD-HHMM-*.md    # Session log files
 ```
+
+## Session Symlink
+
+The plugin creates a `current_session.md` symlink in the sessions directory that always points to the active session file. This allows easy access to the current session from external tools or scripts and to ask ai agent to refference current session and deduce it's location by simple `ls -l current_session.md`
+
+The symlink is automatically updated when:
+- Session starts or is restored
+- Session title changes (file renamed)
+- Session ends (symlink removed)
 
 ## License
 
